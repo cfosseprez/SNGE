@@ -201,14 +201,6 @@ First run includes JIT compilation (~2-5s). Subsequent runs:
 | Numba E-M | 1-5s | Recommended |
 | GPU E-M | <1s | For 10,000+ runs |
 
-## Citation
-
-If you use this package, please cite:
-
-```
-[Your paper reference here]
-```
-
 ## License
 
-[Your license here]
+GPL-3.0
