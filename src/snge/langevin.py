@@ -1,10 +1,23 @@
 """
 Euler-Maruyama integration of the Chemical Langevin Equation (CLE) for the NGE model.
+
+This module provides:
+1. CLE (Chemical Langevin Equation): Noise scales with √(rate/V), volume-dependent
+   - This is a valid approximation for large molecule counts
+
+2. DEPRECATED: Phenomenological SNGE with state-dependent noise σ(b) = σ₀/(b+ε)
+   - WARNING: This is NOT the paper's methodology
+   - The paper uses Gillespie SSA where CV emerges naturally from physics
+
+For the paper's methodology, use:
+    from snge.stochastic_fast import run_ensemble_gillespie_numba
+    from snge.analysis import predict_cv_from_gillespie
 """
 
+import warnings
 import numpy as np
 
-from .models import NGEParameters, SimulationResult
+from .models import NGEParameters, SimulationResult, DimensionlessParameters, SNGEResult
 
 
 def euler_maruyama_cle(params: NGEParameters,
@@ -164,3 +177,161 @@ def euler_maruyama_cle_simple(params: NGEParameters,
         final_yield=final_yield,
         method="Euler-Maruyama CLE (simple)"
     )
+
+
+# =============================================================================
+# DEPRECATED: Phenomenological State-Dependent Noise
+# =============================================================================
+#
+# WARNING: The functions below use phenomenological noise model σ(b) = σ₀/(b+ε)
+# which is NOT the paper's methodology.
+#
+# THE PAPER'S APPROACH:
+# - Run Gillespie SSA with physical N = [A]₀ × V × Nₐ
+# - CV emerges naturally from Poisson statistics of discrete molecular events
+# - No parameters are fitted to variance data
+#
+# Use snge.stochastic_fast.run_ensemble_gillespie_numba() instead.
+#
+
+def euler_maruyama_phenomenological(params, dtau: float = 0.001,
+                                     b0: float = 0.0,
+                                     seed: int = None) -> SNGEResult:
+    """
+    DEPRECATED: Euler-Maruyama with phenomenological state-dependent noise.
+
+    WARNING: This is NOT the paper's methodology. The phenomenological noise
+    model σ(b) = σ₀/(b+ε) fits noise parameters to variance, contradicting
+    the paper's approach where CV emerges naturally from Gillespie SSA.
+
+    Use run_ensemble_gillespie_numba() instead.
+
+    The SDE in dimensionless form:
+        db = [α(1-b) + β(1-b)b - b]dτ + σ(b)dW
+
+    where the noise intensity σ(b) depends on yield:
+        inverse: σ(b) = σ₀ / (b + ε)    - amplified when b is small
+        sqrt:    σ(b) = σ₀ · √b · (1 + κ/b)  - alternative model
+
+    Args:
+        params: DimensionlessParametersPhenomenological instance
+        dtau: Dimensionless time step
+        b0: Initial dimensionless yield (default 0)
+        seed: Random seed for reproducibility
+
+    Returns:
+        SNGEResult with tau and b arrays
+    """
+    warnings.warn(
+        "euler_maruyama_phenomenological (formerly snge_euler_maruyama) is DEPRECATED. "
+        "This phenomenological noise model is NOT the paper's methodology. "
+        "Use run_ensemble_gillespie_numba() instead, where CV emerges naturally.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
+    # Check for required phenomenological parameters
+    if not hasattr(params, 'sigma0') or not hasattr(params, 'epsilon'):
+        raise ValueError(
+            "euler_maruyama_phenomenological requires DimensionlessParametersPhenomenological "
+            "with sigma0, epsilon, and noise_model attributes."
+        )
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Initialize
+    n_steps = int(params.tau_max / dtau) + 1
+    tau = np.linspace(0, params.tau_max, n_steps)
+    b = np.zeros(n_steps)
+    b[0] = b0
+
+    alpha = params.alpha
+    beta = params.beta
+    sigma0 = params.sigma0
+    epsilon = params.epsilon
+    sqrt_dtau = np.sqrt(dtau)
+
+    for i in range(n_steps - 1):
+        b_curr = b[i]
+
+        # Drift term: deterministic SNGE
+        drift = alpha * (1 - b_curr) + beta * (1 - b_curr) * b_curr - b_curr
+
+        # State-dependent noise (KEY DIFFERENCE from CLE)
+        if params.noise_model == "inverse":
+            # Inverse model: σ(b) = σ₀ / (b + ε)
+            # Noise is amplified when b is small (critical period)
+            sigma = sigma0 / (b_curr + epsilon)
+        else:  # sqrt model
+            # Sqrt model: σ(b) = σ₀ · √(b) · (1 + κ/b) where κ = epsilon
+            # This gives σ ∝ 1/√b at small b
+            sigma = sigma0 * np.sqrt(max(b_curr, 1e-10)) * (1 + epsilon / (b_curr + 1e-10))
+
+        # Random increment
+        xi = np.random.normal()
+
+        # Euler-Maruyama update
+        b_new = b_curr + drift * dtau + sigma * sqrt_dtau * xi
+
+        # Enforce physical bounds: 0 ≤ b ≤ 1
+        b[i + 1] = max(0.0, min(1.0, b_new))
+
+    return SNGEResult(
+        tau=tau,
+        b=b,
+        final_yield=b[-1],
+        method="Phenomenological Euler-Maruyama (DEPRECATED)"
+    )
+
+
+def euler_maruyama_phenomenological_ensemble(params,
+                                              n_runs: int = 100,
+                                              dtau: float = 0.001,
+                                              b0: float = 0.0,
+                                              seed: int = None) -> list:
+    """
+    DEPRECATED: Run an ensemble of phenomenological SNGE simulations.
+
+    WARNING: This is NOT the paper's methodology. Use
+    run_ensemble_gillespie_numba() instead.
+
+    Args:
+        params: DimensionlessParametersPhenomenological instance
+        n_runs: Number of independent simulations
+        dtau: Dimensionless time step
+        b0: Initial dimensionless yield
+        seed: Base random seed (each run uses seed+i)
+
+    Returns:
+        List of SNGEResult objects
+    """
+    warnings.warn(
+        "euler_maruyama_phenomenological_ensemble (formerly snge_euler_maruyama_ensemble) "
+        "is DEPRECATED. This phenomenological noise model is NOT the paper's methodology. "
+        "Use run_ensemble_gillespie_numba() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
+    results = []
+
+    for i in range(n_runs):
+        run_seed = (seed + i) if seed is not None else None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            result = euler_maruyama_phenomenological(params, dtau=dtau, b0=b0, seed=run_seed)
+        results.append(result)
+
+    return results
+
+
+# Backwards compatibility aliases (deprecated)
+def snge_euler_maruyama(params, dtau: float = 0.001, b0: float = 0.0, seed: int = None) -> SNGEResult:
+    """DEPRECATED: Use euler_maruyama_phenomenological instead."""
+    return euler_maruyama_phenomenological(params, dtau=dtau, b0=b0, seed=seed)
+
+
+def snge_euler_maruyama_ensemble(params, n_runs: int = 100, dtau: float = 0.001,
+                                  b0: float = 0.0, seed: int = None) -> list:
+    """DEPRECATED: Use euler_maruyama_phenomenological_ensemble instead."""
+    return euler_maruyama_phenomenological_ensemble(params, n_runs=n_runs, dtau=dtau, b0=b0, seed=seed)

@@ -5,15 +5,27 @@ NGE Model Parameter Fitting
 Fit the Nucleation-Growth-Etching (NGE) rate constants to experimental
 time-resolved yield data.
 
+THE PAPER'S APPROACH:
+====================
+1. Fit k₁, k₂, k₃ to MEAN kinetics only
+2. Use Gillespie SSA with physical N = [A]₀ × V × Nₐ
+3. CV emerges naturally - NO fitting to variance data
+
+"The CV is not imposed or fitted—it emerges from running stochastic
+simulations with physical parameters. The model either predicts the
+experimental CV or it doesn't."
+
+CRITICAL POINT: No parameters are fitted to variance data. The molecule
+count N is calculated from physical conditions, not adjusted to match CV.
+The simulated CV is a true prediction.
+
 Workflow:
 1. Load experimental data (multiple runs)
 2. Compute mean kinetics
 3. Fit deterministic NGE to mean
 4. Validate fit quality
 5. Export parameters for stochastic simulations
-
-Author: [Your Name]
-Date: January 2026
+6. Run Gillespie SSA to PREDICT (not fit) CV
 """
 
 import numpy as np
@@ -748,6 +760,218 @@ def main():
     print("=" * 70)
 
     return data, nge_fit, fw_fit
+
+
+# =============================================================================
+# DEPRECATED: PHENOMENOLOGICAL SNGE FITTING FUNCTIONS
+# =============================================================================
+#
+# WARNING: The functions below (fit_sigma0_to_cv, fit_sigma0_from_nge_parameters)
+# are DEPRECATED and contradict the paper's methodology.
+#
+# THE PAPER'S APPROACH:
+# - Fit k₁, k₂, k₃ to mean kinetics ONLY
+# - Run Gillespie SSA with physical N = [A]₀ × V × Nₐ
+# - CV emerges naturally - NO fitting to variance data
+#
+# These functions fit σ₀ to variance data, which is NOT correct.
+# Use predict_cv_from_gillespie() from analysis.py instead.
+#
+
+def fit_sigma0_to_cv(target_cv: float,
+                     alpha: float,
+                     beta: float,
+                     tau_max: float,
+                     epsilon: float = 0.001,
+                     noise_model: str = "inverse",
+                     n_runs: int = 100,
+                     dtau: float = 0.001,
+                     sigma0_range: Tuple[float, float] = (0.001, 0.5),
+                     tol: float = 0.5) -> dict:
+    """
+    DEPRECATED: Fit σ₀ parameter by matching target CV.
+
+    WARNING: This is NOT the paper's methodology. The paper states:
+    "The CV is not imposed or fitted—it emerges from running stochastic
+    simulations with physical parameters."
+
+    This function fits noise parameters to variance data, which contradicts
+    the paper's approach. Use predict_cv_from_gillespie() instead to
+    predict CV from physical parameters without fitting.
+
+    Args:
+        target_cv: Target coefficient of variation (in percent)
+        alpha: k₁/k₃ (nucleation-to-etching ratio)
+        beta: k₂[A]₀/k₃ (growth-to-etching ratio)
+        tau_max: Dimensionless time limit
+        epsilon: Regularization parameter (default 0.001)
+        noise_model: "inverse" or "sqrt"
+        n_runs: Number of simulations per σ₀ trial
+        dtau: Dimensionless time step
+        sigma0_range: (min, max) search range for σ₀
+        tol: Tolerance for CV matching (in percent)
+
+    Returns:
+        Dictionary with fitted σ₀, achieved CV, and search history
+    """
+    warnings.warn(
+        "fit_sigma0_to_cv is DEPRECATED. This is NOT the paper's methodology. "
+        "The paper states: 'The CV is not imposed or fitted—it emerges from "
+        "running stochastic simulations with physical parameters.' "
+        "Use snge.analysis.predict_cv_from_gillespie() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
+    from .models import DimensionlessParametersPhenomenological
+    from .langevin_fast import run_ensemble_snge_numba
+    from .analysis import compute_snge_yield_statistics
+
+    history = []
+    sigma0_low, sigma0_high = sigma0_range
+
+    def compute_cv_for_sigma0(sigma0: float) -> float:
+        """Run ensemble and compute CV for given σ₀."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            params = DimensionlessParametersPhenomenological(
+                alpha=alpha,
+                beta=beta,
+                sigma0=sigma0,
+                epsilon=epsilon,
+                tau_max=tau_max,
+                noise_model=noise_model
+            )
+
+            results = run_ensemble_snge_numba(params, n_runs=n_runs, dtau=dtau,
+                                              show_progress=False)
+        stats = compute_snge_yield_statistics(results)
+        return stats['cv']
+
+    # Bisection search
+    max_iterations = 20
+    for iteration in range(max_iterations):
+        sigma0_mid = (sigma0_low + sigma0_high) / 2
+        cv_mid = compute_cv_for_sigma0(sigma0_mid)
+
+        history.append({
+            'iteration': iteration,
+            'sigma0': sigma0_mid,
+            'cv': cv_mid,
+            'error': cv_mid - target_cv
+        })
+
+        if abs(cv_mid - target_cv) < tol:
+            break
+
+        # Bisection: higher σ₀ → higher CV
+        if cv_mid < target_cv:
+            sigma0_low = sigma0_mid
+        else:
+            sigma0_high = sigma0_mid
+
+    # Final result with more runs for accuracy
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        final_params = DimensionlessParametersPhenomenological(
+            alpha=alpha,
+            beta=beta,
+            sigma0=sigma0_mid,
+            epsilon=epsilon,
+            tau_max=tau_max,
+            noise_model=noise_model
+        )
+
+        final_results = run_ensemble_snge_numba(final_params, n_runs=n_runs * 5,
+                                                dtau=dtau, show_progress=False)
+    final_stats = compute_snge_yield_statistics(final_results)
+
+    return {
+        'sigma0': sigma0_mid,
+        'achieved_cv': final_stats['cv'],
+        'target_cv': target_cv,
+        'cv_error': abs(final_stats['cv'] - target_cv),
+        'converged': abs(final_stats['cv'] - target_cv) < tol * 2,
+        'iterations': len(history),
+        'history': history,
+        'final_stats': final_stats,
+        'parameters': {
+            'alpha': alpha,
+            'beta': beta,
+            'epsilon': epsilon,
+            'tau_max': tau_max,
+            'noise_model': noise_model
+        },
+        'warning': 'DEPRECATED: This is NOT the paper methodology. Use predict_cv_from_gillespie() instead.'
+    }
+
+
+def fit_sigma0_from_nge_parameters(target_cv: float,
+                                    params: 'NGEParameters',
+                                    epsilon: float = 0.001,
+                                    noise_model: str = "inverse",
+                                    n_runs: int = 100,
+                                    dtau: float = 0.001) -> dict:
+    """
+    DEPRECATED: Fit σ₀ using NGE parameters.
+
+    WARNING: This is NOT the paper's methodology. The paper states:
+    "No parameters are fitted to variance data. The molecule count N is
+    calculated from physical conditions, not adjusted to match CV."
+
+    Use predict_cv_from_gillespie() instead.
+
+    Args:
+        target_cv: Target coefficient of variation (in percent)
+        params: NGEParameters instance
+        epsilon: Regularization parameter
+        noise_model: "inverse" or "sqrt"
+        n_runs: Number of simulations per trial
+        dtau: Dimensionless time step
+
+    Returns:
+        Dictionary with fitted σ₀ and statistics
+    """
+    warnings.warn(
+        "fit_sigma0_from_nge_parameters is DEPRECATED. This is NOT the paper's "
+        "methodology. Use snge.analysis.predict_cv_from_gillespie() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
+    from .models import NGEParameters
+
+    if params.k3 == 0:
+        raise ValueError("k3 must be non-zero for SNGE fitting")
+
+    alpha = params.k1 / params.k3
+    beta = params.k2 * params.A0 / params.k3
+    tau_max = params.k3 * params.t_max
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        result = fit_sigma0_to_cv(
+            target_cv=target_cv,
+            alpha=alpha,
+            beta=beta,
+            tau_max=tau_max,
+            epsilon=epsilon,
+            noise_model=noise_model,
+            n_runs=n_runs,
+            dtau=dtau
+        )
+
+    result['nge_parameters'] = {
+        'k1': params.k1,
+        'k2': params.k2,
+        'k3': params.k3,
+        'A0': params.A0,
+        'V': params.V,
+        't_max': params.t_max
+    }
+    result['warning'] = 'DEPRECATED: This is NOT the paper methodology. Use predict_cv_from_gillespie() instead.'
+
+    return result
 
 
 if __name__ == "__main__":

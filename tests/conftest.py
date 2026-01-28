@@ -1,11 +1,22 @@
 """
 Shared pytest fixtures for SNGE test suite.
+
+Note: The phenomenological SNGE model with σ(b) = σ₀/(b+ε) is DEPRECATED.
+The paper's methodology uses Gillespie SSA where CV emerges naturally
+from physical parameters without fitting to variance.
 """
 
+import warnings
 import numpy as np
 import pytest
 
-from snge.models import NGEParameters, SimulationResult
+from snge.models import (
+    NGEParameters,
+    SimulationResult,
+    DimensionlessParameters,
+    SNGEResult,
+    DimensionlessParametersPhenomenological,
+)
 
 
 @pytest.fixture
@@ -61,6 +72,20 @@ def zero_etching_params():
         B0=0.0,
         V=1e-12,  # ~600 molecules
         t_max=50.0
+    )
+
+
+@pytest.fixture
+def seeded_params():
+    """Parameters with initial seeding (B0 > 0) to test seeding effect on CV."""
+    return NGEParameters(
+        k1=2e-4,
+        k2=0.15,
+        k3=0.008,
+        A0=1e-9,
+        B0=1e-10,  # 10% seeding
+        V=1e-12,
+        t_max=30.0
     )
 
 
@@ -185,3 +210,75 @@ def different_distribution_results(small_params):
         ))
 
     return results1, results2
+
+
+@pytest.fixture
+def dimensionless_params(small_params):
+    """DimensionlessParameters for kinetics tests (no phenomenological noise)."""
+    return DimensionlessParameters.from_nge_parameters(small_params)
+
+
+@pytest.fixture
+def dimensionless_params_phenomenological():
+    """
+    DEPRECATED: DimensionlessParametersPhenomenological for legacy tests.
+
+    WARNING: This uses the phenomenological noise model which is NOT
+    the paper's methodology.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return DimensionlessParametersPhenomenological(
+            alpha=0.025,      # k1/k3 = 2e-4 / 8e-3 = 0.025
+            beta=0.01875,     # k2*A0/k3 = 0.15 * 1e-9 / 8e-3 ≈ 0.01875
+            sigma0=0.05,      # Moderate noise (DEPRECATED parameter)
+            epsilon=0.001,    # Regularization (DEPRECATED parameter)
+            tau_max=0.24,     # k3 * t_max = 8e-3 * 30 = 0.24
+            noise_model="inverse"  # DEPRECATED parameter
+        )
+
+
+@pytest.fixture
+def dimensionless_params_high_noise():
+    """
+    DEPRECATED: High noise phenomenological parameters for stress testing.
+
+    WARNING: This uses the phenomenological noise model which is NOT
+    the paper's methodology.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return DimensionlessParametersPhenomenological(
+            alpha=0.025,
+            beta=0.01875,
+            sigma0=0.3,       # High noise (DEPRECATED)
+            epsilon=0.001,
+            tau_max=0.24,
+            noise_model="inverse"
+        )
+
+
+@pytest.fixture
+def mock_snge_results():
+    """Mock SNGEResult list for analysis tests."""
+    np.random.seed(42)
+    n_runs = 50
+    n_points = 101
+    tau_max = 0.24
+    tau = np.linspace(0, tau_max, n_points)
+
+    results = []
+    for i in range(n_runs):
+        # Create synthetic trajectories with some variability
+        base_yield = 0.6 + 0.1 * np.random.randn()
+        b = base_yield * (1 - np.exp(-10 * tau / tau_max))
+        b = np.clip(b, 0, 1)
+
+        results.append(SNGEResult(
+            tau=tau.copy(),
+            b=b,
+            final_yield=b[-1],
+            method="Mock"
+        ))
+
+    return results

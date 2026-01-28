@@ -1,15 +1,25 @@
 """
-Accelerated Euler-Maruyama CLE implementations.
+Accelerated Euler-Maruyama implementations for CLE.
 
 Provides:
 - Numba JIT-compiled version (CPU, 10-50x faster)
 - CuPy GPU version (for large ensembles, 100x+ faster)
+
+DEPRECATED: Phenomenological SNGE noise models
+- The functions snge_euler_maruyama_numba and run_ensemble_snge_numba are
+  DEPRECATED. They use phenomenological noise model σ(b) = σ₀/(b+ε) which
+  is NOT the paper's methodology.
+
+For the paper's approach, use:
+    from snge.stochastic_fast import run_ensemble_gillespie_numba
+    from snge.analysis import predict_cv_from_gillespie
 """
 
+import warnings
 import numpy as np
 from numba import njit, prange
 
-from .models import NGEParameters, SimulationResult
+from .models import NGEParameters, SimulationResult, DimensionlessParameters, SNGEResult
 
 
 @njit(cache=True)
@@ -380,3 +390,326 @@ def run_ensemble_euler_maruyama_gpu(params: NGEParameters,
         ))
 
     return results
+
+
+# =============================================================================
+# DEPRECATED: Phenomenological State-Dependent Noise (Numba-accelerated)
+# =============================================================================
+#
+# WARNING: The functions below use phenomenological noise model σ(b) = σ₀/(b+ε)
+# which is NOT the paper's methodology.
+#
+# THE PAPER'S APPROACH:
+# - Run Gillespie SSA with physical N = [A]₀ × V × Nₐ
+# - CV emerges naturally from Poisson statistics of discrete molecular events
+# - No parameters are fitted to variance data
+#
+# Use snge.stochastic_fast.run_ensemble_gillespie_numba() instead.
+#
+
+# Noise model constants for Numba (enums not supported)
+NOISE_MODEL_INVERSE = 0
+NOISE_MODEL_SQRT = 1
+
+
+@njit(cache=True)
+def _snge_euler_maruyama_kernel(alpha: float, beta: float, sigma0: float,
+                                 epsilon: float, tau_max: float, dtau: float,
+                                 b0: float, noise_model: int, n_steps: int) -> tuple:
+    """
+    Numba-compiled SNGE Euler-Maruyama kernel.
+
+    The SDE: db = [α(1-b) + β(1-b)b - b]dτ + σ(b)dW
+
+    where σ(b) depends on the noise model:
+        inverse (0): σ(b) = σ₀ / (b + ε)
+        sqrt (1):    σ(b) = σ₀ · √b · (1 + κ/b)
+
+    Args:
+        alpha: k₁/k₃ (nucleation-to-etching ratio)
+        beta: k₂[A]₀/k₃ (growth-to-etching ratio)
+        sigma0: Perturbation intensity
+        epsilon: Regularization parameter
+        tau_max: Maximum dimensionless time
+        dtau: Dimensionless time step
+        b0: Initial dimensionless yield
+        noise_model: 0=inverse, 1=sqrt
+        n_steps: Number of time steps
+
+    Returns:
+        (tau, b): Time and yield arrays
+    """
+    tau = np.linspace(0.0, tau_max, n_steps)
+    b = np.zeros(n_steps)
+    b[0] = b0
+
+    sqrt_dtau = np.sqrt(dtau)
+
+    for i in range(n_steps - 1):
+        b_curr = b[i]
+
+        # Drift term
+        drift = alpha * (1 - b_curr) + beta * (1 - b_curr) * b_curr - b_curr
+
+        # State-dependent noise
+        if noise_model == NOISE_MODEL_INVERSE:
+            sigma = sigma0 / (b_curr + epsilon)
+        else:  # NOISE_MODEL_SQRT
+            b_safe = max(b_curr, 1e-10)
+            sigma = sigma0 * np.sqrt(b_safe) * (1 + epsilon / b_safe)
+
+        # Random increment
+        xi = np.random.randn()
+
+        # Euler-Maruyama update
+        b_new = b_curr + drift * dtau + sigma * sqrt_dtau * xi
+
+        # Enforce bounds: 0 ≤ b ≤ 1
+        if b_new < 0:
+            b_new = 0
+        if b_new > 1:
+            b_new = 1
+
+        b[i + 1] = b_new
+
+    return tau, b
+
+
+def euler_maruyama_phenomenological_numba(params, dtau: float = 0.001, b0: float = 0.0) -> SNGEResult:
+    """
+    DEPRECATED: Numba-accelerated phenomenological Euler-Maruyama.
+
+    WARNING: This is NOT the paper's methodology. The phenomenological noise
+    model σ(b) = σ₀/(b+ε) fits noise parameters to variance, contradicting
+    the paper's approach where CV emerges naturally from Gillespie SSA.
+
+    Use run_ensemble_gillespie_numba() instead.
+
+    Args:
+        params: DimensionlessParametersPhenomenological instance
+        dtau: Dimensionless time step
+        b0: Initial dimensionless yield
+
+    Returns:
+        SNGEResult with tau and b arrays
+    """
+    warnings.warn(
+        "euler_maruyama_phenomenological_numba (formerly snge_euler_maruyama_numba) is DEPRECATED. "
+        "This phenomenological noise model is NOT the paper's methodology. "
+        "Use run_ensemble_gillespie_numba() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
+    # Check for required phenomenological parameters
+    if not hasattr(params, 'sigma0') or not hasattr(params, 'epsilon'):
+        raise ValueError(
+            "euler_maruyama_phenomenological_numba requires DimensionlessParametersPhenomenological "
+            "with sigma0, epsilon, and noise_model attributes."
+        )
+
+    n_steps = int(params.tau_max / dtau) + 1
+    noise_model = NOISE_MODEL_INVERSE if params.noise_model == "inverse" else NOISE_MODEL_SQRT
+
+    tau, b = _snge_euler_maruyama_kernel(
+        params.alpha, params.beta, params.sigma0, params.epsilon,
+        params.tau_max, dtau, b0, noise_model, n_steps
+    )
+
+    return SNGEResult(
+        tau=tau,
+        b=b,
+        final_yield=b[-1],
+        method="Phenomenological Euler-Maruyama (Numba, DEPRECATED)"
+    )
+
+
+# Backwards compatibility alias
+def snge_euler_maruyama_numba(params, dtau: float = 0.001, b0: float = 0.0) -> SNGEResult:
+    """DEPRECATED: Use euler_maruyama_phenomenological_numba instead."""
+    return euler_maruyama_phenomenological_numba(params, dtau=dtau, b0=b0)
+
+
+@njit(parallel=True, cache=True)
+def _snge_ensemble_kernel(n_runs: int, alpha: float, beta: float, sigma0: float,
+                          epsilon: float, tau_max: float, dtau: float,
+                          b0: float, noise_model: int, n_steps: int) -> tuple:
+    """
+    Parallel SNGE ensemble kernel with Numba prange.
+
+    Runs multiple independent SNGE trajectories in parallel.
+
+    Args:
+        n_runs: Number of independent simulations
+        alpha, beta, sigma0, epsilon: SNGE parameters
+        tau_max: Maximum dimensionless time
+        dtau: Time step
+        b0: Initial yield
+        noise_model: 0=inverse, 1=sqrt
+        n_steps: Number of time steps
+
+    Returns:
+        (tau, all_b, final_yields): Time array, all trajectories, final yields
+    """
+    sqrt_dtau = np.sqrt(dtau)
+
+    # Shared time points
+    tau = np.linspace(0.0, tau_max, n_steps)
+
+    # Storage for all runs
+    all_b = np.zeros((n_runs, n_steps))
+    final_yields = np.zeros(n_runs)
+
+    for run in prange(n_runs):
+        all_b[run, 0] = b0
+
+        for i in range(n_steps - 1):
+            b_curr = all_b[run, i]
+
+            # Drift term
+            drift = alpha * (1 - b_curr) + beta * (1 - b_curr) * b_curr - b_curr
+
+            # State-dependent noise
+            if noise_model == NOISE_MODEL_INVERSE:
+                sigma = sigma0 / (b_curr + epsilon)
+            else:
+                b_safe = max(b_curr, 1e-10)
+                sigma = sigma0 * np.sqrt(b_safe) * (1 + epsilon / b_safe)
+
+            # Random increment
+            xi = np.random.randn()
+
+            # Euler-Maruyama update with bounds enforcement
+            b_new = b_curr + drift * dtau + sigma * sqrt_dtau * xi
+
+            if b_new < 0:
+                b_new = 0
+            if b_new > 1:
+                b_new = 1
+
+            all_b[run, i + 1] = b_new
+
+        final_yields[run] = all_b[run, -1]
+
+    return tau, all_b, final_yields
+
+
+def run_ensemble_phenomenological_numba(params,
+                                         n_runs: int = 1000,
+                                         dtau: float = 0.001,
+                                         b0: float = 0.0,
+                                         show_progress: bool = True,
+                                         batch_size: int = None) -> list:
+    """
+    DEPRECATED: Run ensemble of phenomenological simulations using Numba.
+
+    WARNING: This is NOT the paper's methodology. The phenomenological noise
+    model σ(b) = σ₀/(b+ε) fits noise parameters to variance data.
+
+    THE PAPER'S APPROACH:
+    - Run Gillespie SSA with physical N = [A]₀ × V × Nₐ
+    - CV emerges naturally - no fitting to variance data
+    - Use run_ensemble_gillespie_numba() instead
+
+    Args:
+        params: DimensionlessParametersPhenomenological instance
+        n_runs: Number of independent simulations
+        dtau: Dimensionless time step
+        b0: Initial dimensionless yield
+        show_progress: Show progress bar between batches
+        batch_size: Number of simulations per batch (for progress). None = auto
+
+    Returns:
+        List of SNGEResult objects
+    """
+    warnings.warn(
+        "run_ensemble_phenomenological_numba (formerly run_ensemble_snge_numba) is DEPRECATED. "
+        "This phenomenological noise model is NOT the paper's methodology. "
+        "Use run_ensemble_gillespie_numba() instead, where CV emerges naturally.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
+    # Check for required phenomenological parameters
+    if not hasattr(params, 'sigma0') or not hasattr(params, 'epsilon'):
+        raise ValueError(
+            "run_ensemble_phenomenological_numba requires DimensionlessParametersPhenomenological "
+            "with sigma0, epsilon, and noise_model attributes."
+        )
+
+    import time as time_module
+    from tqdm import tqdm
+
+    n_steps = int(params.tau_max / dtau) + 1
+    noise_model = NOISE_MODEL_INVERSE if params.noise_model == "inverse" else NOISE_MODEL_SQRT
+
+    # Auto batch size
+    if batch_size is None:
+        batch_size = max(1, n_runs // 20)
+
+    results = []
+
+    if show_progress:
+        # Estimate time with small test batch
+        test_batch = min(10, n_runs)
+        start = time_module.time()
+        _snge_ensemble_kernel(
+            test_batch, params.alpha, params.beta, params.sigma0, params.epsilon,
+            params.tau_max, dtau, b0, noise_model, n_steps
+        )
+        elapsed = time_module.time() - start
+        time_per_sim = elapsed / test_batch
+        total_est = time_per_sim * n_runs
+        print(f"Estimated time: {total_est:.1f}s ({time_per_sim*1000:.2f}ms per simulation)")
+
+        # Run in batches with progress bar
+        pbar = tqdm(total=n_runs, desc="SNGE", unit="runs")
+        n_done = 0
+
+        while n_done < n_runs:
+            batch = min(batch_size, n_runs - n_done)
+
+            tau, all_b, final_yields = _snge_ensemble_kernel(
+                batch, params.alpha, params.beta, params.sigma0, params.epsilon,
+                params.tau_max, dtau, b0, noise_model, n_steps
+            )
+
+            for i in range(batch):
+                results.append(SNGEResult(
+                    tau=tau.copy(),
+                    b=all_b[i].copy(),
+                    final_yield=final_yields[i],
+                    method="Phenomenological Euler-Maruyama (Numba, DEPRECATED)"
+                ))
+
+            n_done += batch
+            pbar.update(batch)
+
+        pbar.close()
+    else:
+        # Run all at once
+        tau, all_b, final_yields = _snge_ensemble_kernel(
+            n_runs, params.alpha, params.beta, params.sigma0, params.epsilon,
+            params.tau_max, dtau, b0, noise_model, n_steps
+        )
+
+        for i in range(n_runs):
+            results.append(SNGEResult(
+                tau=tau.copy(),
+                b=all_b[i].copy(),
+                final_yield=final_yields[i],
+                method="Phenomenological Euler-Maruyama (Numba, DEPRECATED)"
+            ))
+
+    return results
+
+
+# Backwards compatibility alias
+def run_ensemble_snge_numba(params, n_runs: int = 1000, dtau: float = 0.001,
+                            b0: float = 0.0, show_progress: bool = True,
+                            batch_size: int = None) -> list:
+    """DEPRECATED: Use run_ensemble_phenomenological_numba instead."""
+    return run_ensemble_phenomenological_numba(
+        params, n_runs=n_runs, dtau=dtau, b0=b0,
+        show_progress=show_progress, batch_size=batch_size
+    )
